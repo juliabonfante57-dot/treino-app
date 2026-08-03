@@ -1,0 +1,4 @@
+# Nunca suba isso pro GitHub - são credenciais/segredos
+.streamlit/secrets.toml
+*.json
+__pycache__/
