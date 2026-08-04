@@ -171,8 +171,8 @@ st.markdown('<div class="cabecalho-app">💪 Treino App</div>', unsafe_allow_htm
 st.write("")  # respiro visual antes das abas
 
 # st.tabs cria abas clicáveis - cada uma equivale a uma opção do menu antigo
-aba_rotina, aba_registrar, aba_historico, aba_estatisticas, aba_evolucao = st.tabs(
-    ["Minha Rotina", "Registrar", "Histórico", "Estatísticas", "Evolução"]
+aba_sessao, aba_rotina, aba_registrar, aba_historico, aba_estatisticas, aba_evolucao = st.tabs(
+    ["🏋️ Sessão", "Minha Rotina", "Registrar", "Histórico", "Estatísticas", "Evolução"]
 )
 
 # Busca os dados da planilha UMA vez só aqui, e reaproveita nas abas abaixo.
@@ -183,6 +183,90 @@ aba_rotina, aba_registrar, aba_historico, aba_estatisticas, aba_evolucao = st.ta
 # Requests). Buscando uma vez só e reaproveitando, cortamos isso bastante.
 df_treinos = carregar_dados()
 rotina = carregar_rotina()
+
+# ---------- Aba: Sessão (modo treino guiado) ----------
+with aba_sessao:
+    st.caption("Escolha o treino de hoje e vá passando pelos exercícios, um de cada vez.")
+
+    if not rotina:
+        st.warning("Cadastre seu treino primeiro na aba **Minha Rotina**.")
+    else:
+        # st.session_state guarda informação que persiste entre as interações
+        # dentro da mesma sessão do navegador (diferente de session pra session,
+        # já que cada pessoa que abre o app tem o seu próprio st.session_state).
+        # Aqui usamos pra lembrar qual dia foi escolhido e quais exercícios já
+        # foram concluídos NESSA sessão de treino.
+        if "sessao_dia" not in st.session_state:
+            st.session_state.sessao_dia = None
+        if "sessao_concluidos" not in st.session_state:
+            st.session_state.sessao_concluidos = []
+        if "sessao_ordem" not in st.session_state:
+            st.session_state.sessao_ordem = []
+
+        dia_escolhido = st.selectbox("Treino de hoje", list(rotina.keys()), key="select_dia_sessao")
+
+        # Se trocou de dia, zera o progresso da sessão anterior e recomeça
+        # a fila na ordem original cadastrada em Minha Rotina.
+        if dia_escolhido != st.session_state.sessao_dia:
+            st.session_state.sessao_dia = dia_escolhido
+            st.session_state.sessao_concluidos = []
+            st.session_state.sessao_ordem = list(rotina[dia_escolhido])
+
+        exercicios_do_dia = rotina[dia_escolhido]
+
+        if not exercicios_do_dia:
+            st.warning(f"O treino {dia_escolhido} ainda não tem exercícios cadastrados.")
+        else:
+            # A fila usa "sessao_ordem" (que pode ser reorganizada ao pular um
+            # exercício) em vez da lista original - assim um exercício pulado
+            # vai pro final, sem perder a posição dos outros.
+            pendentes = [e for e in st.session_state.sessao_ordem if e not in st.session_state.sessao_concluidos]
+
+            total = len(exercicios_do_dia)
+            feitos = len(st.session_state.sessao_concluidos)
+            st.progress(feitos / total)
+            st.caption(f"{feitos} de {total} exercícios concluídos")
+
+            if not pendentes:
+                st.success("🎉 Treino concluído! Mandou bem.")
+                if st.button("Começar de novo"):
+                    st.session_state.sessao_concluidos = []
+                    st.session_state.sessao_ordem = list(exercicios_do_dia)
+                    st.rerun()
+            else:
+                exercicio_atual = pendentes[0]
+                st.subheader(f"Agora: {exercicio_atual}")
+
+                # Botão de pular fica FORA do form (não precisa preencher nada
+                # pra pular) - só reordena a fila, manda esse exercício pro final.
+                if len(pendentes) > 1:
+                    if st.button("⏭️ Pular por agora (equipamento ocupado)"):
+                        st.session_state.sessao_ordem.remove(exercicio_atual)
+                        st.session_state.sessao_ordem.append(exercicio_atual)
+                        st.rerun()
+
+                with st.form("form_sessao", clear_on_submit=True):
+                    peso = st.number_input("Peso (kg)", min_value=0.0, step=2.5)
+                    reps = st.number_input("Repetições por série", min_value=0, step=1)
+                    series = st.number_input("Número de séries", min_value=0, step=1)
+                    concluir = st.form_submit_button("✅ Concluir e ir pro próximo")
+
+                    if concluir:
+                        linha = {
+                            "data": date.today(), "tipo": "musculacao", "nome": exercicio_atual,
+                            "peso_kg": peso, "reps": reps, "series": series,
+                            "duracao_min": "", "distancia_km": "",
+                        }
+                        salvar_treino(df_treinos, linha)
+                        st.session_state.sessao_concluidos.append(exercicio_atual)
+                        st.rerun()
+
+                # Mostra o que já foi feito e o que ainda falta, pra ter uma visão geral
+                if st.session_state.sessao_concluidos:
+                    st.caption("✅ Já feito: " + ", ".join(st.session_state.sessao_concluidos))
+                restantes = pendentes[1:]
+                if restantes:
+                    st.caption("⏳ Depois vem: " + ", ".join(restantes))
 
 # ---------- Aba: Minha Rotina ----------
 with aba_rotina:
@@ -358,23 +442,62 @@ with aba_estatisticas:
 # ---------- Aba: Evolução ----------
 with aba_evolucao:
     df = df_treinos
-    musculacao = df[df["tipo"] == "musculacao"]
 
-    if musculacao.empty:
-        st.info("Registre exercícios de musculação para ver a evolução.")
+    if df.empty:
+        st.info("Registre treinos para ver a evolução.")
     else:
-        # selectbox mostra um menu suspenso com os exercícios já registrados,
-        # sem o usuário ter que digitar o nome certinho
-        exercicios = sorted(musculacao["nome"].unique())
-        escolhido = st.selectbox("Escolha o exercício", exercicios)
+        tipo_evolucao = st.radio("Tipo", ["Musculação", "Cardio"], horizontal=True, key="tipo_evolucao")
 
-        dados_exercicio = musculacao[musculacao["nome"] == escolhido].sort_values("data")
+        if tipo_evolucao == "Musculação":
+            musculacao = df[df["tipo"] == "musculacao"]
 
-        # st.line_chart desenha o gráfico direto a partir do DataFrame -
-        # não precisa nem do matplotlib aqui, o Streamlit já tem gráfico embutido
-        st.line_chart(dados_exercicio.set_index("data")["peso_kg"])
+            if musculacao.empty:
+                st.info("Registre exercícios de musculação para ver a evolução.")
+            else:
+                # selectbox mostra um menu suspenso com os exercícios já registrados,
+                # sem o usuário ter que digitar o nome certinho
+                exercicios = sorted(musculacao["nome"].unique())
+                escolhido = st.selectbox("Escolha o exercício", exercicios)
 
-        primeiro = dados_exercicio["peso_kg"].iloc[0]
-        ultimo = dados_exercicio["peso_kg"].iloc[-1]
-        diferenca = ultimo - primeiro
-        st.write(f"Resumo: de **{primeiro}kg** para **{ultimo}kg** ({'+' if diferenca >= 0 else ''}{diferenca}kg no total)")
+                dados_exercicio = musculacao[musculacao["nome"] == escolhido].sort_values("data")
+
+                # st.line_chart desenha o gráfico direto a partir do DataFrame -
+                # não precisa nem do matplotlib aqui, o Streamlit já tem gráfico embutido
+                st.line_chart(dados_exercicio.set_index("data")["peso_kg"])
+
+                primeiro = dados_exercicio["peso_kg"].iloc[0]
+                ultimo = dados_exercicio["peso_kg"].iloc[-1]
+                diferenca = ultimo - primeiro
+                st.write(f"Resumo: de **{primeiro}kg** para **{ultimo}kg** ({'+' if diferenca >= 0 else ''}{diferenca}kg no total)")
+
+        else:  # Cardio
+            cardio = df[df["tipo"] == "cardio"]
+
+            if cardio.empty:
+                st.info("Registre atividades de cardio para ver a evolução.")
+            else:
+                atividades = sorted(cardio["nome"].unique())
+                escolhida = st.selectbox("Escolha a atividade", atividades)
+
+                dados_atividade = cardio[cardio["nome"] == escolhida].sort_values("data")
+
+                # Mostra duração e distância lado a lado, cada um com seu gráfico -
+                # nem todo cardio tem distância registrada (ex: bike ergométrica),
+                # então cada gráfico só aparece se tiver dado de verdade.
+                tem_duracao = dados_atividade["duracao_min"].notna().any()
+                tem_distancia = dados_atividade["distancia_km"].notna().any() and (dados_atividade["distancia_km"] != "").any()
+
+                if tem_duracao:
+                    st.write("**Duração (min)**")
+                    st.line_chart(dados_atividade.set_index("data")["duracao_min"])
+
+                if tem_distancia:
+                    st.write("**Distância (km)**")
+                    dados_com_distancia = dados_atividade[dados_atividade["distancia_km"].notna() & (dados_atividade["distancia_km"] != "")]
+                    st.line_chart(dados_com_distancia.set_index("data")["distancia_km"])
+
+                primeiro = dados_atividade["duracao_min"].iloc[0]
+                ultimo = dados_atividade["duracao_min"].iloc[-1]
+                diferenca = ultimo - primeiro
+                st.write(f"Resumo de duração: de **{primeiro} min** para **{ultimo} min** ({'+' if diferenca >= 0 else ''}{diferenca} min no total)")
+
