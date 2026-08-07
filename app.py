@@ -23,10 +23,13 @@ locais entre reinicializações do servidor).
 
 import streamlit as st
 import pandas as pd
+import uuid        # gera um "código único" (ID) pra cada treino registrado -
+                    # assim dá pra editar/excluir um específico, mesmo que
+                    # dois registros pareçam idênticos (mesma data, mesmo exercício)
 from datetime import date
 from streamlit_gsheets import GSheetsConnection
 
-COLUNAS = ["data", "tipo", "nome", "peso_kg", "reps", "series", "duracao_min", "distancia_km"]
+COLUNAS = ["id", "data", "tipo", "nome", "peso_kg", "reps", "series", "duracao_min", "distancia_km"]
 
 # st.connection cuida de autenticar e reaproveitar a conexão entre as
 # interações do app, usando as credenciais guardadas em secrets.toml.
@@ -42,15 +45,44 @@ def carregar_dados():
     df = df.dropna(how="all")   # remove linhas totalmente vazias
     if df.empty:
         return pd.DataFrame(columns=COLUNAS)
+
+    # Migração automática: treinos registrados antes de existir o campo "id"
+    # ganham um ID novo aqui, na primeira vez que essa versão do app roda.
+    if "id" not in df.columns:
+        df["id"] = ""
+    faltando = df["id"].isna() | (df["id"].astype(str).str.strip() == "")
+    if faltando.any():
+        df.loc[faltando, "id"] = [str(uuid.uuid4()) for _ in range(faltando.sum())]
+        conn.update(worksheet="treinos", data=df)
+        st.cache_data.clear()
+
     return df
 
 
 def salvar_treino(df_atual: pd.DataFrame, nova_linha: dict):
     """Adiciona um treino novo (a partir dos dados já carregados) e reescreve a aba 'treinos'."""
+    nova_linha["id"] = str(uuid.uuid4())
     df_novo = pd.concat([df_atual, pd.DataFrame([nova_linha])], ignore_index=True)
     conn.update(worksheet="treinos", data=df_novo)
     # Limpa o cache pra próxima leitura já vir com o dado novo, em vez de
     # esperar os 60 segundos do ttl.
+    st.cache_data.clear()
+
+
+def atualizar_treino(df_atual: pd.DataFrame, id_treino: str, campos_novos: dict):
+    """Atualiza os campos de UM treino específico (identificado pelo id) e reescreve a planilha."""
+    df_novo = df_atual.copy()
+    indice = df_novo[df_novo["id"] == id_treino].index
+    for campo, valor in campos_novos.items():
+        df_novo.loc[indice, campo] = valor
+    conn.update(worksheet="treinos", data=df_novo)
+    st.cache_data.clear()
+
+
+def excluir_treino(df_atual: pd.DataFrame, id_treino: str):
+    """Remove UM treino específico (identificado pelo id) e reescreve a planilha."""
+    df_novo = df_atual[df_atual["id"] != id_treino]
+    conn.update(worksheet="treinos", data=df_novo)
     st.cache_data.clear()
 
 
@@ -102,9 +134,10 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@500;700&display=swap');
 
 :root {
-    --cor-forca: #D4A24C;   /* âmbar - musculação, cor de placa de peso */
-    --cor-cardio: #4FA8A0;  /* verde-azulado - cardio */
-    --cor-texto-fraco: #8B929A;
+    --cor-forca: #FFC94D;    /* amarelo - musculação */
+    --cor-cardio: #6EC1E4;   /* azul claro - cardio */
+    --cor-primaria: #EC7FB0; /* rosa - cor principal (botões, aba ativa) */
+    --cor-texto-fraco: #8D93A8;
 }
 
 /* Título principal */
@@ -124,21 +157,53 @@ st.markdown("""
     margin-bottom: 0.2rem;
 }
 
-/* Abas com aparência de painel segmentado */
+/* Barra de navegação fixa no topo - fica visível mesmo rolando a página,
+   igual a maioria dos apps de celular de verdade. */
 .stTabs [data-baseweb="tab-list"] {
-    gap: 4px;
+    gap: 6px;
+    position: sticky;
+    top: 0;
+    z-index: 999;
+    background-color: #FAFAFC;
+    padding: 0.6rem 0 0.8rem 0;
+    border-bottom: 1px solid #E3E6ED;
 }
+
+/* Cada aba vira uma "pílula" arredondada em vez de uma aba tradicional */
 .stTabs [data-baseweb="tab"] {
     font-family: 'Space Grotesk', sans-serif;
     font-weight: 500;
-    height: 42px;
+    font-size: 0.85rem;
+    height: 38px;
+    background-color: #FFFFFF;
+    border: 1px solid #E3E6ED;
+    border-radius: 20px;
+    padding: 0 14px;
+}
+/* Aba ativa ganha destaque sólido na cor principal (rosa) */
+.stTabs [aria-selected="true"] {
+    background-color: var(--cor-primaria) !important;
+    color: #FFFFFF !important;
+    border-color: var(--cor-primaria) !important;
+}
+/* Remove aquela linha sublinhada padrão do Streamlit embaixo da aba ativa,
+   já que agora o destaque é o preenchimento inteiro da pílula */
+.stTabs [data-baseweb="tab-highlight"] {
+    display: none;
+}
+
+/* Botões com cantos mais arredondados, mais parecido com botão de app mobile */
+.stButton button, .stFormSubmitButton button {
+    border-radius: 10px;
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 500;
 }
 
 /* Cards de estatística estilo "placar" */
 .card-placar {
-    background-color: #242A31;
-    border: 1px solid #333B44;
-    border-top: 3px solid var(--borda-cor, var(--cor-forca));
+    background-color: #FFFFFF;
+    border: 1px solid #E3E6ED;
+    border-top: 3px solid var(--borda-cor, var(--cor-primaria));
     border-radius: 6px;
     padding: 0.9rem 1rem;
     margin-bottom: 0.6rem;
@@ -155,12 +220,18 @@ st.markdown("""
     font-family: 'JetBrains Mono', monospace;
     font-weight: 700;
     font-size: 1.6rem;
-    color: #EDEAE3;
+    color: #2B2D42;
+}
+
+/* Cards de lista (exercícios da Sessão, registros do Histórico) com cantos
+   arredondados, mais parecido com "cells" de lista de um app mobile */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 12px !important;
 }
 
 /* Tabela e inputs com cantos levemente arredondados */
 [data-testid="stDataFrame"] {
-    border: 1px solid #333B44;
+    border: 1px solid #E3E6ED;
     border-radius: 6px;
 }
 </style>
@@ -172,7 +243,7 @@ st.write("")  # respiro visual antes das abas
 
 # st.tabs cria abas clicáveis - cada uma equivale a uma opção do menu antigo
 aba_sessao, aba_rotina, aba_registrar, aba_historico, aba_estatisticas, aba_evolucao = st.tabs(
-    ["🏋️ Sessão", "Minha Rotina", "Registrar", "Histórico", "Estatísticas", "Evolução"]
+    ["🏋️ Sessão", "🗂️ Rotina", "➕ Registrar", "📜 Histórico", "📊 Estatísticas", "📈 Evolução"]
 )
 
 # Busca os dados da planilha UMA vez só aqui, e reaproveita nas abas abaixo.
@@ -184,89 +255,87 @@ aba_sessao, aba_rotina, aba_registrar, aba_historico, aba_estatisticas, aba_evol
 df_treinos = carregar_dados()
 rotina = carregar_rotina()
 
-# ---------- Aba: Sessão (modo treino guiado) ----------
+# ---------- Aba: Sessão (lista clicável do treino de hoje) ----------
 with aba_sessao:
-    st.caption("Escolha o treino de hoje e vá passando pelos exercícios, um de cada vez.")
+    st.caption("Escolha o treino de hoje e clique no exercício que você fez pra registrar.")
 
     if not rotina:
         st.warning("Cadastre seu treino primeiro na aba **Minha Rotina**.")
     else:
-        # st.session_state guarda informação que persiste entre as interações
-        # dentro da mesma sessão do navegador (diferente de session pra session,
-        # já que cada pessoa que abre o app tem o seu próprio st.session_state).
-        # Aqui usamos pra lembrar qual dia foi escolhido e quais exercícios já
-        # foram concluídos NESSA sessão de treino.
-        if "sessao_dia" not in st.session_state:
-            st.session_state.sessao_dia = None
-        if "sessao_concluidos" not in st.session_state:
-            st.session_state.sessao_concluidos = []
-        if "sessao_ordem" not in st.session_state:
-            st.session_state.sessao_ordem = []
-
         dia_escolhido = st.selectbox("Treino de hoje", list(rotina.keys()), key="select_dia_sessao")
-
-        # Se trocou de dia, zera o progresso da sessão anterior e recomeça
-        # a fila na ordem original cadastrada em Minha Rotina.
-        if dia_escolhido != st.session_state.sessao_dia:
-            st.session_state.sessao_dia = dia_escolhido
-            st.session_state.sessao_concluidos = []
-            st.session_state.sessao_ordem = list(rotina[dia_escolhido])
-
         exercicios_do_dia = rotina[dia_escolhido]
 
         if not exercicios_do_dia:
             st.warning(f"O treino {dia_escolhido} ainda não tem exercícios cadastrados.")
         else:
-            # A fila usa "sessao_ordem" (que pode ser reorganizada ao pular um
-            # exercício) em vez da lista original - assim um exercício pulado
-            # vai pro final, sem perder a posição dos outros.
-            pendentes = [e for e in st.session_state.sessao_ordem if e not in st.session_state.sessao_concluidos]
+            hoje = str(date.today())
+
+            # O que já foi "concluído" é calculado a partir dos dados REAIS já
+            # salvos hoje - não de uma memória temporária que se perde. Assim,
+            # mesmo se você recarregar a página ou voltar depois, o progresso
+            # continua certo.
+            feitos_hoje = df_treinos[
+                (df_treinos["tipo"] == "musculacao")
+                & (df_treinos["data"].astype(str) == hoje)
+            ]
+            nomes_feitos_hoje = set(feitos_hoje["nome"])
 
             total = len(exercicios_do_dia)
-            feitos = len(st.session_state.sessao_concluidos)
-            st.progress(feitos / total)
-            st.caption(f"{feitos} de {total} exercícios concluídos")
+            feitos = sum(1 for e in exercicios_do_dia if e in nomes_feitos_hoje)
+            st.progress(feitos / total if total else 0)
+            st.caption(f"{feitos} de {total} exercícios concluídos hoje")
 
-            if not pendentes:
+            if "exercicio_ativo" not in st.session_state:
+                st.session_state.exercicio_ativo = None
+
+            for exercicio in exercicios_do_dia:
+                concluido = exercicio in nomes_feitos_hoje
+
+                with st.container(border=True):
+                    col_nome, col_botao = st.columns([3, 1])
+
+                    if concluido:
+                        # Pega o registro de hoje pra esse exercício (o mais
+                        # recente, caso tenha sido registrado mais de uma vez)
+                        ultimo = feitos_hoje[feitos_hoje["nome"] == exercicio].iloc[-1]
+                        col_nome.markdown(
+                            f"✅ **{exercicio}**  \n"
+                            f"<span style='color:#8D93A8;font-size:0.85rem'>{ultimo['peso_kg']}kg × {ultimo['reps']} reps × {ultimo['series']} séries</span>",
+                            unsafe_allow_html=True,
+                        )
+                        rotulo_botao = "Registrar de novo"
+                    else:
+                        col_nome.write(f"◻️ {exercicio}")
+                        rotulo_botao = "Registrar"
+
+                    if col_botao.button(rotulo_botao, key=f"btn_sessao_{exercicio}"):
+                        # Clicar de novo no mesmo exercício fecha o formulário
+                        # (funciona como um "abre/fecha")
+                        if st.session_state.exercicio_ativo == exercicio:
+                            st.session_state.exercicio_ativo = None
+                        else:
+                            st.session_state.exercicio_ativo = exercicio
+                        st.rerun()
+
+                    if st.session_state.exercicio_ativo == exercicio:
+                        with st.form(f"form_sessao_{exercicio}"):
+                            peso = st.number_input("Peso (kg)", min_value=0.0, step=2.5, key=f"peso_{exercicio}")
+                            reps = st.number_input("Repetições por série", min_value=0, step=1, key=f"reps_{exercicio}")
+                            series = st.number_input("Número de séries", min_value=0, step=1, key=f"series_{exercicio}")
+                            confirmar = st.form_submit_button("✅ Salvar")
+
+                            if confirmar:
+                                linha = {
+                                    "data": date.today(), "tipo": "musculacao", "nome": exercicio,
+                                    "peso_kg": peso, "reps": reps, "series": series,
+                                    "duracao_min": "", "distancia_km": "",
+                                }
+                                salvar_treino(df_treinos, linha)
+                                st.session_state.exercicio_ativo = None
+                                st.rerun()
+
+            if feitos == total:
                 st.success("🎉 Treino concluído! Mandou bem.")
-                if st.button("Começar de novo"):
-                    st.session_state.sessao_concluidos = []
-                    st.session_state.sessao_ordem = list(exercicios_do_dia)
-                    st.rerun()
-            else:
-                exercicio_atual = pendentes[0]
-                st.subheader(f"Agora: {exercicio_atual}")
-
-                # Botão de pular fica FORA do form (não precisa preencher nada
-                # pra pular) - só reordena a fila, manda esse exercício pro final.
-                if len(pendentes) > 1:
-                    if st.button("⏭️ Pular por agora (equipamento ocupado)"):
-                        st.session_state.sessao_ordem.remove(exercicio_atual)
-                        st.session_state.sessao_ordem.append(exercicio_atual)
-                        st.rerun()
-
-                with st.form("form_sessao", clear_on_submit=True):
-                    peso = st.number_input("Peso (kg)", min_value=0.0, step=2.5)
-                    reps = st.number_input("Repetições por série", min_value=0, step=1)
-                    series = st.number_input("Número de séries", min_value=0, step=1)
-                    concluir = st.form_submit_button("✅ Concluir e ir pro próximo")
-
-                    if concluir:
-                        linha = {
-                            "data": date.today(), "tipo": "musculacao", "nome": exercicio_atual,
-                            "peso_kg": peso, "reps": reps, "series": series,
-                            "duracao_min": "", "distancia_km": "",
-                        }
-                        salvar_treino(df_treinos, linha)
-                        st.session_state.sessao_concluidos.append(exercicio_atual)
-                        st.rerun()
-
-                # Mostra o que já foi feito e o que ainda falta, pra ter uma visão geral
-                if st.session_state.sessao_concluidos:
-                    st.caption("✅ Já feito: " + ", ".join(st.session_state.sessao_concluidos))
-                restantes = pendentes[1:]
-                if restantes:
-                    st.caption("⏳ Depois vem: " + ", ".join(restantes))
 
 # ---------- Aba: Minha Rotina ----------
 with aba_rotina:
@@ -392,15 +461,65 @@ with aba_historico:
     if df.empty:
         st.info("Ainda não há treinos registrados.")
     else:
-        # Filtro de busca simples, parecido com a opção "Buscar" do treino.py
         busca = st.text_input("🔍 Filtrar por nome do exercício/atividade")
         if busca:
             df_mostrar = df[df["nome"].str.contains(busca, case=False, na=False)]
         else:
             df_mostrar = df
 
-        # st.dataframe já desenha uma tabela interativa (ordenável, com scroll)
-        st.dataframe(df_mostrar.sort_values("data", ascending=False), use_container_width=True)
+        df_mostrar = df_mostrar.sort_values("data", ascending=False)
+
+        if "editando_id" not in st.session_state:
+            st.session_state.editando_id = None
+
+        for _, linha in df_mostrar.iterrows():
+            with st.container(border=True):
+                if linha["tipo"] == "musculacao":
+                    texto = f"**{linha['data']}** · {linha['nome']} — {linha['peso_kg']}kg × {linha['reps']} reps × {linha['series']} séries"
+                else:
+                    texto = f"**{linha['data']}** · {linha['nome']} (cardio) — {linha['duracao_min']} min, {linha['distancia_km']} km"
+
+                col_info, col_editar, col_excluir = st.columns([5, 1, 1])
+                col_info.markdown(texto)
+
+                if col_editar.button("✏️", key=f"editar_{linha['id']}"):
+                    st.session_state.editando_id = None if st.session_state.editando_id == linha["id"] else linha["id"]
+                    st.rerun()
+
+                if col_excluir.button("🗑️", key=f"excluir_{linha['id']}"):
+                    excluir_treino(df, linha["id"])
+                    st.success("Treino excluído.")
+                    st.rerun()
+
+                # Formulário de edição aparece só embaixo do registro clicado
+                if st.session_state.editando_id == linha["id"]:
+                    with st.form(f"form_editar_{linha['id']}"):
+                        if linha["tipo"] == "musculacao":
+                            novo_peso = st.number_input("Peso (kg)", min_value=0.0, step=2.5, value=float(linha["peso_kg"]))
+                            novo_reps = st.number_input("Repetições", min_value=0, step=1, value=int(linha["reps"]))
+                            nova_series = st.number_input("Séries", min_value=0, step=1, value=int(linha["series"]))
+                            salvar = st.form_submit_button("Salvar alterações")
+                            if salvar:
+                                atualizar_treino(df, linha["id"], {
+                                    "peso_kg": novo_peso, "reps": novo_reps, "series": nova_series,
+                                })
+                                st.session_state.editando_id = None
+                                st.rerun()
+                        else:
+                            nova_duracao = st.number_input("Duração (min)", min_value=0.0, step=5.0, value=float(linha["duracao_min"] or 0))
+                            distancia_atual = linha["distancia_km"]
+                            nova_distancia = st.number_input(
+                                "Distância (km)", min_value=0.0, step=0.5,
+                                value=float(distancia_atual) if str(distancia_atual).strip() not in ("", "nan") else 0.0,
+                            )
+                            salvar = st.form_submit_button("Salvar alterações")
+                            if salvar:
+                                atualizar_treino(df, linha["id"], {
+                                    "duracao_min": nova_duracao, "distancia_km": nova_distancia,
+                                })
+                                st.session_state.editando_id = None
+                                st.rerun()
+
 
 # ---------- Aba: Estatísticas ----------
 with aba_estatisticas:
@@ -430,14 +549,14 @@ with aba_estatisticas:
             """, unsafe_allow_html=True)
 
         col1, col2 = st.columns(2)
-        card_placar(col1, "Total de registros", len(df), "#8B929A")
-        card_placar(col2, "Volume total (kg)", f"{volume_total:.0f}", "#D4A24C")
+        card_placar(col1, "Total de registros", len(df), "#8D93A8")
+        card_placar(col2, "Volume total (kg)", f"{volume_total:.0f}", "#FFC94D")
 
         col3, col4 = st.columns(2)
-        card_placar(col3, "Exercícios de musculação", len(musculacao), "#D4A24C")
-        card_placar(col4, "Sessões de cardio", len(cardio), "#4FA8A0")
+        card_placar(col3, "Exercícios de musculação", len(musculacao), "#FFC94D")
+        card_placar(col4, "Sessões de cardio", len(cardio), "#6EC1E4")
 
-        card_placar(st, "Minutos totais de cardio", f"{minutos_cardio:.0f} min", "#4FA8A0")
+        card_placar(st, "Minutos totais de cardio", f"{minutos_cardio:.0f} min", "#6EC1E4")
 
 # ---------- Aba: Evolução ----------
 with aba_evolucao:
