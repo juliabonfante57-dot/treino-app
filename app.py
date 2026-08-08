@@ -321,7 +321,7 @@ with aba_semana:
     if not rotina:
         st.warning("Cadastre seus treinos primeiro na aba **Rotina**.")
     else:
-        opcoes_semana = ["Descanso"] + list(rotina.keys())
+        opcoes_semana = ["Descanso", "Cardio"] + list(rotina.keys())
 
         # --- Visão geral da semana atual: o que já foi concluído de verdade ---
         segunda_atual = date.today() - timedelta(days=date.today().weekday())
@@ -398,7 +398,7 @@ with aba_sessao:
     if not rotina:
         st.warning("Cadastre seu treino primeiro na aba **Minha Rotina**.")
     else:
-        opcoes_dia = list(rotina.keys())
+        opcoes_dia = ["Cardio"] + list(rotina.keys())
 
         # Mostra a sugestão do plano semanal (aba Semana), se houver uma pra
         # hoje - mas é só uma sugestão: o multiselect abaixo continua livre
@@ -415,12 +415,46 @@ with aba_sessao:
             "Treino(s) de hoje", opcoes_dia, default=sugeridos_validos, key="select_dia_sessao",
         )
 
-        if not dias_escolhidos:
-            st.caption("Escolha pelo menos um treino acima pra começar.")
+        # "Cardio" é uma opção livre (não é um dia cadastrado na Rotina), então
+        # ela é tratada à parte - não entra no checklist com progresso, porque
+        # não tem um item fixo pra marcar como concluído.
+        cardio_livre_escolhido = "Cardio" in dias_escolhidos
+        dias_rotina_escolhidos = [d for d in dias_escolhidos if d != "Cardio"]
+
+        if cardio_livre_escolhido:
+            with st.container(border=True):
+                st.write("🏃 **Cardio livre**")
+                with st.form("form_cardio_livre"):
+                    atividades_cardio_comuns = ["Corrida", "Bike", "Elíptico", "Natação", "Outro"]
+                    atividade = st.selectbox("Atividade", atividades_cardio_comuns, key="atividade_cardio_livre")
+                    nome_outro_cardio = ""
+                    if atividade == "Outro":
+                        nome_outro_cardio = st.text_input("Qual atividade?", key="nome_outro_cardio_livre")
+                    duracao_livre = st.number_input("Duração (min)", min_value=0.0, step=5.0, key="dur_cardio_livre")
+                    distancia_livre = st.number_input("Distância (km, opcional)", min_value=0.0, step=0.5, key="dist_cardio_livre")
+                    confirmar_cardio = st.form_submit_button("✅ Salvar")
+
+                    if confirmar_cardio:
+                        nome_final = nome_outro_cardio if atividade == "Outro" else atividade
+                        if not nome_final:
+                            st.error("Digite o nome da atividade.")
+                        else:
+                            linha = {
+                                "data": date.today(), "tipo": "cardio", "nome": nome_final,
+                                "peso_kg": "", "reps": "", "series": "",
+                                "duracao_min": duracao_livre, "distancia_km": distancia_livre,
+                            }
+                            salvar_treino(df_treinos, linha)
+                            st.success(f"✅ {nome_final} registrado!")
+                            st.rerun()
+
+        if not dias_rotina_escolhidos:
+            if not cardio_livre_escolhido:
+                st.caption("Escolha pelo menos um treino acima pra começar.")
         else:
             # Junta os itens de todos os treinos escolhidos numa lista só
             itens_do_dia = []
-            for dia in dias_escolhidos:
+            for dia in dias_rotina_escolhidos:
                 itens_do_dia.extend(rotina[dia])
 
             if not itens_do_dia:
