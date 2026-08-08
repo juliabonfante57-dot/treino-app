@@ -122,6 +122,29 @@ def salvar_rotina(rotina: dict):
     st.cache_data.clear()
 
 
+DIAS_SEMANA = ["Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira",
+               "Sexta-feira", "Sábado", "Domingo"]
+
+
+def carregar_semana():
+    """Lê a aba 'semana' e devolve um dicionário {"Segunda-feira": "A", ...}."""
+    df = conn.read(worksheet="semana", ttl=60)
+    df = df.dropna(how="all")
+
+    plano = {}
+    for _, linha in df.iterrows():
+        plano[linha["dia_semana"]] = linha["treino"]
+    return plano
+
+
+def salvar_semana(plano: dict):
+    """Reescreve a aba 'semana' inteira a partir do dicionário atual."""
+    linhas = [{"dia_semana": dia, "treino": treino} for dia, treino in plano.items()]
+    df = pd.DataFrame(linhas, columns=["dia_semana", "treino"])
+    conn.update(worksheet="semana", data=df)
+    st.cache_data.clear()
+
+
 # ---------- Configuração da página ----------
 st.set_page_config(page_title="Treino App", page_icon="💪", layout="centered")
 
@@ -242,8 +265,8 @@ st.markdown('<div class="cabecalho-app">💪 Treino App</div>', unsafe_allow_htm
 st.write("")  # respiro visual antes das abas
 
 # st.tabs cria abas clicáveis - cada uma equivale a uma opção do menu antigo
-aba_sessao, aba_rotina, aba_registrar, aba_historico, aba_estatisticas, aba_evolucao = st.tabs(
-    ["🏋️ Sessão", "🗂️ Rotina", "➕ Registrar", "📜 Histórico", "📊 Estatísticas", "📈 Evolução"]
+aba_sessao, aba_semana, aba_rotina, aba_registrar, aba_historico, aba_estatisticas, aba_evolucao = st.tabs(
+    ["🏋️ Sessão", "📅 Semana", "🗂️ Rotina", "➕ Registrar", "📜 Histórico", "📊 Estatísticas", "📈 Evolução"]
 )
 
 # Busca os dados da planilha UMA vez só aqui, e reaproveita nas abas abaixo.
@@ -254,6 +277,36 @@ aba_sessao, aba_rotina, aba_registrar, aba_historico, aba_estatisticas, aba_evol
 # Requests). Buscando uma vez só e reaproveitando, cortamos isso bastante.
 df_treinos = carregar_dados()
 rotina = carregar_rotina()
+plano_semana = carregar_semana()
+
+# Descobre o dia da semana de hoje (em português) e o treino sugerido pra
+# esse dia, se houver um plano cadastrado. weekday() dá 0 pra segunda,
+# 6 pra domingo - por isso a lista DIAS_SEMANA começa em "Segunda-feira".
+dia_semana_hoje = DIAS_SEMANA[date.today().weekday()]
+treino_sugerido_hoje = plano_semana.get(dia_semana_hoje)
+
+# ---------- Aba: Semana (planejamento, só uma sugestão) ----------
+with aba_semana:
+    st.caption("Organize qual treino fazer em cada dia. É só uma sugestão pro app te lembrar - você pode sempre escolher outro na hora.")
+
+    if not rotina:
+        st.warning("Cadastre seus treinos primeiro na aba **Rotina**.")
+    else:
+        opcoes_semana = ["Descanso"] + list(rotina.keys())
+
+        with st.form("form_semana"):
+            novo_plano = {}
+            for dia in DIAS_SEMANA:
+                valor_atual = plano_semana.get(dia, "Descanso")
+                indice_atual = opcoes_semana.index(valor_atual) if valor_atual in opcoes_semana else 0
+                escolha = st.selectbox(dia, opcoes_semana, index=indice_atual, key=f"semana_{dia}")
+                novo_plano[dia] = escolha
+
+            salvar = st.form_submit_button("💾 Salvar semana")
+            if salvar:
+                salvar_semana(novo_plano)
+                st.success("Planejamento da semana atualizado!")
+                st.rerun()
 
 # ---------- Aba: Sessão (lista clicável do treino de hoje) ----------
 with aba_sessao:
@@ -262,7 +315,21 @@ with aba_sessao:
     if not rotina:
         st.warning("Cadastre seu treino primeiro na aba **Minha Rotina**.")
     else:
-        dia_escolhido = st.selectbox("Treino de hoje", list(rotina.keys()), key="select_dia_sessao")
+        opcoes_dia = list(rotina.keys())
+
+        # Mostra a sugestão do plano semanal (aba Semana), se houver uma pra
+        # hoje - mas é só uma sugestão: o selectbox abaixo continua livre
+        # pra escolher qualquer treino, a qualquer momento.
+        if treino_sugerido_hoje and treino_sugerido_hoje in opcoes_dia:
+            st.info(f"📅 Hoje é **{dia_semana_hoje}** — seu treino planejado é o **{treino_sugerido_hoje}**. Mas fique à vontade pra escolher outro!")
+            indice_padrao = opcoes_dia.index(treino_sugerido_hoje)
+        elif treino_sugerido_hoje == "Descanso":
+            st.info(f"📅 Hoje ({dia_semana_hoje}) você planejou descanso. Treinando mesmo assim? Escolha um treino abaixo.")
+            indice_padrao = 0
+        else:
+            indice_padrao = 0
+
+        dia_escolhido = st.selectbox("Treino de hoje", opcoes_dia, index=indice_padrao, key="select_dia_sessao")
         exercicios_do_dia = rotina[dia_escolhido]
 
         if not exercicios_do_dia:
