@@ -26,7 +26,7 @@ import pandas as pd
 import uuid        # gera um "código único" (ID) pra cada treino registrado -
                     # assim dá pra editar/excluir um específico, mesmo que
                     # dois registros pareçam idênticos (mesma data, mesmo exercício)
-from datetime import date
+from datetime import date, timedelta
 from streamlit_gsheets import GSheetsConnection
 
 COLUNAS = ["id", "data", "tipo", "nome", "peso_kg", "reps", "series", "duracao_min", "distancia_km"]
@@ -87,37 +87,42 @@ def excluir_treino(df_atual: pd.DataFrame, id_treino: str):
 
 
 def carregar_rotina():
-    """Lê a aba 'rotina' e monta um dicionário {"A": ["Supino reto", ...], "B": [...]}."""
+    """Lê a aba 'rotina' e monta um dicionário {"A": [{"nome":"Supino reto","tipo":"musculacao"}, ...]}."""
     df = conn.read(worksheet="rotina", ttl=60)
     df = df.dropna(how="all")
+
+    # Migração: planilhas antigas não tinham a coluna "tipo" (só existia
+    # musculação até então) - se não existir, assume musculação pra tudo.
+    if "tipo" not in df.columns:
+        df["tipo"] = "musculacao"
 
     rotina = {}
     for _, linha in df.iterrows():
         dia = linha["dia"]
         exercicio = linha["exercicio"]
+        tipo = linha["tipo"] if pd.notna(linha["tipo"]) and str(linha["tipo"]).strip() != "" else "musculacao"
         rotina.setdefault(dia, [])   # garante que o dia existe, mesmo sem exercícios
         # Uma linha "marcadora" (exercício em branco) só existe pra guardar o
         # dia vazio na planilha - não é um exercício de verdade, então não
         # entra na lista.
         if pd.notna(exercicio) and str(exercicio).strip() != "":
-            rotina[dia].append(exercicio)
+            rotina[dia].append({"nome": exercicio, "tipo": tipo})
     return rotina
 
 
 def salvar_rotina(rotina: dict):
-    """Reescreve a aba 'rotina' inteira a partir do dicionário atual (uma linha por exercício)."""
+    """Reescreve a aba 'rotina' inteira a partir do dicionário atual (uma linha por item)."""
     linhas = []
-    for dia, exercicios in rotina.items():
-        if exercicios:
-            for exercicio in exercicios:
-                linhas.append({"dia": dia, "exercicio": exercicio})
+    for dia, itens in rotina.items():
+        if itens:
+            for item in itens:
+                linhas.append({"dia": dia, "exercicio": item["nome"], "tipo": item["tipo"]})
         else:
-            # Dia sem exercícios ainda: salva uma linha "marcadora" com
-            # exercício em branco, só pra planilha não esquecer que esse
-            # dia existe.
-            linhas.append({"dia": dia, "exercicio": ""})
+            # Dia sem itens ainda: salva uma linha "marcadora" com exercício
+            # em branco, só pra planilha não esquecer que esse dia existe.
+            linhas.append({"dia": dia, "exercicio": "", "tipo": ""})
 
-    df = pd.DataFrame(linhas, columns=["dia", "exercicio"])
+    df = pd.DataFrame(linhas, columns=["dia", "exercicio", "tipo"])
     conn.update(worksheet="rotina", data=df)
     st.cache_data.clear()
 
@@ -127,22 +132,46 @@ DIAS_SEMANA = ["Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira",
 
 
 def carregar_semana():
-    """Lê a aba 'semana' e devolve um dicionário {"Segunda-feira": "A", ...}."""
+    """Lê a aba 'semana' e devolve {"Segunda-feira": ["A", "Corrida"], ...} - listas, já que pode ter mais de um treino no mesmo dia."""
     df = conn.read(worksheet="semana", ttl=60)
     df = df.dropna(how="all")
 
-    plano = {}
+    plano = {dia: [] for dia in DIAS_SEMANA}
     for _, linha in df.iterrows():
-        plano[linha["dia_semana"]] = linha["treino"]
+        dia = linha["dia_semana"]
+        treino = linha["treino"]
+        if dia in plano and pd.notna(treino) and str(treino).strip() != "":
+            plano[dia].append(treino)
     return plano
 
 
 def salvar_semana(plano: dict):
-    """Reescreve a aba 'semana' inteira a partir do dicionário atual."""
-    linhas = [{"dia_semana": dia, "treino": treino} for dia, treino in plano.items()]
+    """Reescreve a aba 'semana' inteira (uma linha por treino escolhido em cada dia)."""
+    linhas = []
+    for dia, treinos in plano.items():
+        if treinos:
+            for treino in treinos:
+                linhas.append({"dia_semana": dia, "treino": treino})
+        else:
+            linhas.append({"dia_semana": dia, "treino": ""})
     df = pd.DataFrame(linhas, columns=["dia_semana", "treino"])
     conn.update(worksheet="semana", data=df)
     st.cache_data.clear()
+
+
+def dia_foi_cumprido(data_do_dia, treinos_planejados, rotina, df_treinos):
+    """Confere se TODOS os itens dos treinos planejados pra essa data foram
+    registrados nessa data. Devolve None se não havia nada planejado."""
+    itens_planejados = []
+    for treino in treinos_planejados:
+        itens_planejados.extend(rotina.get(treino, []))
+
+    if not itens_planejados:
+        return None  # dia de descanso ou sem plano - não conta como pendência
+
+    feitos_no_dia = df_treinos[df_treinos["data"].astype(str) == str(data_do_dia)]
+    concluidos = set(zip(feitos_no_dia["tipo"], feitos_no_dia["nome"]))
+    return all((item["tipo"], item["nome"]) in concluidos for item in itens_planejados)
 
 
 # ---------- Configuração da página ----------
@@ -294,12 +323,66 @@ with aba_semana:
     else:
         opcoes_semana = ["Descanso"] + list(rotina.keys())
 
+        # --- Visão geral da semana atual: o que já foi concluído de verdade ---
+        segunda_atual = date.today() - timedelta(days=date.today().weekday())
+        st.write("**Essa semana**")
+        colunas_semana = st.columns(7)
+
+        for i, dia_nome in enumerate(DIAS_SEMANA):
+            data_do_dia = segunda_atual + timedelta(days=i)
+            treinos_planejados = [t for t in plano_semana.get(dia_nome, []) if t != "Descanso" and t in rotina]
+            cumprido = dia_foi_cumprido(data_do_dia, treinos_planejados, rotina, df_treinos)
+
+            with colunas_semana[i]:
+                st.caption(dia_nome[:3])
+                if cumprido is None:
+                    st.write("—")  # dia de descanso ou sem plano
+                elif cumprido:
+                    st.write("✅")
+                elif data_do_dia > date.today():
+                    st.write("⏳")   # ainda não chegou o dia
+                else:
+                    st.write("⚠️")   # já passou e não foi concluído
+
+        # --- Histórico: quais semanas anteriores foram batidas por completo ---
+        with st.expander("📊 Histórico das últimas semanas"):
+            st.caption("Compara os dias passados com o plano ATUAL - se você mudou a rotina recentemente, semanas bem antigas podem não refletir o que você pretendia treinar na época.")
+
+            for semanas_atras in range(0, 8):
+                segunda_da_semana = segunda_atual - timedelta(weeks=semanas_atras)
+                domingo_da_semana = segunda_da_semana + timedelta(days=6)
+
+                dias_com_plano = 0
+                dias_cumpridos = 0
+                for i, dia_nome in enumerate(DIAS_SEMANA):
+                    data_do_dia = segunda_da_semana + timedelta(days=i)
+                    if data_do_dia > date.today():
+                        continue  # não julga dias que ainda não chegaram
+                    treinos_planejados = [t for t in plano_semana.get(dia_nome, []) if t != "Descanso" and t in rotina]
+                    cumprido = dia_foi_cumprido(data_do_dia, treinos_planejados, rotina, df_treinos)
+                    if cumprido is not None:
+                        dias_com_plano += 1
+                        if cumprido:
+                            dias_cumpridos += 1
+
+                rotulo_periodo = f"{segunda_da_semana.strftime('%d/%m')} – {domingo_da_semana.strftime('%d/%m')}"
+                rotulo_periodo += " (atual)" if semanas_atras == 0 else ""
+
+                if dias_com_plano == 0:
+                    st.write(f"{rotulo_periodo}: — sem treino planejado")
+                elif dias_cumpridos == dias_com_plano:
+                    st.write(f"{rotulo_periodo}: ✅ semana completa ({dias_cumpridos}/{dias_com_plano})")
+                else:
+                    st.write(f"{rotulo_periodo}: ⚠️ {dias_cumpridos}/{dias_com_plano} dias")
+
+        st.divider()
+
+        # --- Formulário de planejamento ---
         with st.form("form_semana"):
             novo_plano = {}
             for dia in DIAS_SEMANA:
-                valor_atual = plano_semana.get(dia, "Descanso")
-                indice_atual = opcoes_semana.index(valor_atual) if valor_atual in opcoes_semana else 0
-                escolha = st.selectbox(dia, opcoes_semana, index=indice_atual, key=f"semana_{dia}")
+                valores_atuais = [v for v in plano_semana.get(dia, []) if v in opcoes_semana]
+                escolha = st.multiselect(dia, opcoes_semana, default=valores_atuais, key=f"semana_{dia}")
                 novo_plano[dia] = escolha
 
             salvar = st.form_submit_button("💾 Salvar semana")
@@ -310,7 +393,7 @@ with aba_semana:
 
 # ---------- Aba: Sessão (lista clicável do treino de hoje) ----------
 with aba_sessao:
-    st.caption("Escolha o treino de hoje e clique no exercício que você fez pra registrar.")
+    st.caption("Escolha o(s) treino(s) de hoje e clique no item que você fez pra registrar.")
 
     if not rotina:
         st.warning("Cadastre seu treino primeiro na aba **Minha Rotina**.")
@@ -318,91 +401,117 @@ with aba_sessao:
         opcoes_dia = list(rotina.keys())
 
         # Mostra a sugestão do plano semanal (aba Semana), se houver uma pra
-        # hoje - mas é só uma sugestão: o selectbox abaixo continua livre
-        # pra escolher qualquer treino, a qualquer momento.
-        if treino_sugerido_hoje and treino_sugerido_hoje in opcoes_dia:
-            st.info(f"📅 Hoje é **{dia_semana_hoje}** — seu treino planejado é o **{treino_sugerido_hoje}**. Mas fique à vontade pra escolher outro!")
-            indice_padrao = opcoes_dia.index(treino_sugerido_hoje)
-        elif treino_sugerido_hoje == "Descanso":
-            st.info(f"📅 Hoje ({dia_semana_hoje}) você planejou descanso. Treinando mesmo assim? Escolha um treino abaixo.")
-            indice_padrao = 0
+        # hoje - mas é só uma sugestão: o multiselect abaixo continua livre
+        # pra escolher qualquer treino, a qualquer momento. Pode ter mais de
+        # um treino sugerido pro mesmo dia (ex: musculação + cardio).
+        sugeridos_validos = [t for t in treino_sugerido_hoje if t in opcoes_dia]
+        if sugeridos_validos:
+            texto_sugestao = " e ".join(f"**{t}**" for t in sugeridos_validos)
+            st.info(f"📅 Hoje é **{dia_semana_hoje}** — treino planejado: {texto_sugestao}. Mas fique à vontade pra mudar!")
+        elif treino_sugerido_hoje == ["Descanso"]:
+            st.info(f"📅 Hoje ({dia_semana_hoje}) você planejou descanso. Treinando mesmo assim? Escolha abaixo.")
+
+        dias_escolhidos = st.multiselect(
+            "Treino(s) de hoje", opcoes_dia, default=sugeridos_validos, key="select_dia_sessao",
+        )
+
+        if not dias_escolhidos:
+            st.caption("Escolha pelo menos um treino acima pra começar.")
         else:
-            indice_padrao = 0
+            # Junta os itens de todos os treinos escolhidos numa lista só
+            itens_do_dia = []
+            for dia in dias_escolhidos:
+                itens_do_dia.extend(rotina[dia])
 
-        dia_escolhido = st.selectbox("Treino de hoje", opcoes_dia, index=indice_padrao, key="select_dia_sessao")
-        exercicios_do_dia = rotina[dia_escolhido]
+            if not itens_do_dia:
+                st.warning("Esse(s) treino(s) ainda não têm itens cadastrados.")
+            else:
+                hoje = str(date.today())
 
-        if not exercicios_do_dia:
-            st.warning(f"O treino {dia_escolhido} ainda não tem exercícios cadastrados.")
-        else:
-            hoje = str(date.today())
+                # O que já foi "concluído" é calculado a partir dos dados REAIS
+                # já salvos hoje - não de uma memória temporária que se perde.
+                # Combina tipo+nome pra não confundir um item de musculação
+                # com um de cardio que tenha o mesmo nome por coincidência.
+                feitos_hoje_df = df_treinos[df_treinos["data"].astype(str) == hoje]
+                concluidos_hoje = set(zip(feitos_hoje_df["tipo"], feitos_hoje_df["nome"]))
 
-            # O que já foi "concluído" é calculado a partir dos dados REAIS já
-            # salvos hoje - não de uma memória temporária que se perde. Assim,
-            # mesmo se você recarregar a página ou voltar depois, o progresso
-            # continua certo.
-            feitos_hoje = df_treinos[
-                (df_treinos["tipo"] == "musculacao")
-                & (df_treinos["data"].astype(str) == hoje)
-            ]
-            nomes_feitos_hoje = set(feitos_hoje["nome"])
+                total = len(itens_do_dia)
+                feitos = sum(1 for item in itens_do_dia if (item["tipo"], item["nome"]) in concluidos_hoje)
+                st.progress(feitos / total if total else 0)
+                st.caption(f"{feitos} de {total} itens concluídos hoje")
 
-            total = len(exercicios_do_dia)
-            feitos = sum(1 for e in exercicios_do_dia if e in nomes_feitos_hoje)
-            st.progress(feitos / total if total else 0)
-            st.caption(f"{feitos} de {total} exercícios concluídos hoje")
+                if "exercicio_ativo" not in st.session_state:
+                    st.session_state.exercicio_ativo = None
 
-            if "exercicio_ativo" not in st.session_state:
-                st.session_state.exercicio_ativo = None
+                for item in itens_do_dia:
+                    nome_item = item["nome"]
+                    tipo_item = item["tipo"]
+                    chave_item = f"{tipo_item}_{nome_item}"
+                    concluido = (tipo_item, nome_item) in concluidos_hoje
+                    icone_tipo = "🏋️" if tipo_item == "musculacao" else "🏃"
 
-            for exercicio in exercicios_do_dia:
-                concluido = exercicio in nomes_feitos_hoje
+                    with st.container(border=True):
+                        col_nome, col_botao = st.columns([3, 1])
 
-                with st.container(border=True):
-                    col_nome, col_botao = st.columns([3, 1])
-
-                    if concluido:
-                        # Pega o registro de hoje pra esse exercício (o mais
-                        # recente, caso tenha sido registrado mais de uma vez)
-                        ultimo = feitos_hoje[feitos_hoje["nome"] == exercicio].iloc[-1]
-                        col_nome.markdown(
-                            f"✅ **{exercicio}**  \n"
-                            f"<span style='color:#8D93A8;font-size:0.85rem'>{ultimo['peso_kg']}kg × {ultimo['reps']} reps × {ultimo['series']} séries</span>",
-                            unsafe_allow_html=True,
-                        )
-                        rotulo_botao = "Registrar de novo"
-                    else:
-                        col_nome.write(f"◻️ {exercicio}")
-                        rotulo_botao = "Registrar"
-
-                    if col_botao.button(rotulo_botao, key=f"btn_sessao_{exercicio}"):
-                        # Clicar de novo no mesmo exercício fecha o formulário
-                        # (funciona como um "abre/fecha")
-                        if st.session_state.exercicio_ativo == exercicio:
-                            st.session_state.exercicio_ativo = None
+                        if concluido:
+                            ultimo = feitos_hoje_df[
+                                (feitos_hoje_df["tipo"] == tipo_item) & (feitos_hoje_df["nome"] == nome_item)
+                            ].iloc[-1]
+                            if tipo_item == "musculacao":
+                                detalhe = f"{ultimo['peso_kg']}kg × {ultimo['reps']} reps × {ultimo['series']} séries"
+                            else:
+                                detalhe = f"{ultimo['duracao_min']} min" + (f" · {ultimo['distancia_km']} km" if str(ultimo['distancia_km']).strip() not in ("", "nan") else "")
+                            col_nome.markdown(
+                                f"✅ {icone_tipo} **{nome_item}**  \n"
+                                f"<span style='color:#8D93A8;font-size:0.85rem'>{detalhe}</span>",
+                                unsafe_allow_html=True,
+                            )
+                            rotulo_botao = "Registrar de novo"
                         else:
-                            st.session_state.exercicio_ativo = exercicio
-                        st.rerun()
+                            col_nome.write(f"◻️ {icone_tipo} {nome_item}")
+                            rotulo_botao = "Registrar"
 
-                    if st.session_state.exercicio_ativo == exercicio:
-                        with st.form(f"form_sessao_{exercicio}"):
-                            peso = st.number_input("Peso (kg)", min_value=0.0, step=2.5, key=f"peso_{exercicio}")
-                            reps = st.number_input("Repetições por série", min_value=0, step=1, key=f"reps_{exercicio}")
-                            series = st.number_input("Número de séries", min_value=0, step=1, key=f"series_{exercicio}")
-                            confirmar = st.form_submit_button("✅ Salvar")
-
-                            if confirmar:
-                                linha = {
-                                    "data": date.today(), "tipo": "musculacao", "nome": exercicio,
-                                    "peso_kg": peso, "reps": reps, "series": series,
-                                    "duracao_min": "", "distancia_km": "",
-                                }
-                                salvar_treino(df_treinos, linha)
+                        if col_botao.button(rotulo_botao, key=f"btn_sessao_{chave_item}"):
+                            # Clicar de novo no mesmo item fecha o formulário
+                            # (funciona como um "abre/fecha")
+                            if st.session_state.exercicio_ativo == chave_item:
                                 st.session_state.exercicio_ativo = None
-                                st.rerun()
+                            else:
+                                st.session_state.exercicio_ativo = chave_item
+                            st.rerun()
 
-            if feitos == total:
-                st.success("🎉 Treino concluído! Mandou bem.")
+                        if st.session_state.exercicio_ativo == chave_item:
+                            with st.form(f"form_sessao_{chave_item}"):
+                                if tipo_item == "musculacao":
+                                    peso = st.number_input("Peso (kg)", min_value=0.0, step=2.5, key=f"peso_{chave_item}")
+                                    reps = st.number_input("Repetições por série", min_value=0, step=1, key=f"reps_{chave_item}")
+                                    series = st.number_input("Número de séries", min_value=0, step=1, key=f"series_{chave_item}")
+                                    confirmar = st.form_submit_button("✅ Salvar")
+                                    if confirmar:
+                                        linha = {
+                                            "data": date.today(), "tipo": "musculacao", "nome": nome_item,
+                                            "peso_kg": peso, "reps": reps, "series": series,
+                                            "duracao_min": "", "distancia_km": "",
+                                        }
+                                        salvar_treino(df_treinos, linha)
+                                        st.session_state.exercicio_ativo = None
+                                        st.rerun()
+                                else:
+                                    duracao = st.number_input("Duração (min)", min_value=0.0, step=5.0, key=f"dur_{chave_item}")
+                                    distancia = st.number_input("Distância (km, opcional)", min_value=0.0, step=0.5, key=f"dist_{chave_item}")
+                                    confirmar = st.form_submit_button("✅ Salvar")
+                                    if confirmar:
+                                        linha = {
+                                            "data": date.today(), "tipo": "cardio", "nome": nome_item,
+                                            "peso_kg": "", "reps": "", "series": "",
+                                            "duracao_min": duracao, "distancia_km": distancia,
+                                        }
+                                        salvar_treino(df_treinos, linha)
+                                        st.session_state.exercicio_ativo = None
+                                        st.rerun()
+
+                if feitos == total:
+                    st.success("🎉 Treino concluído! Mandou bem.")
 
 # ---------- Aba: Minha Rotina ----------
 with aba_rotina:
@@ -435,28 +544,46 @@ with aba_rotina:
     if not rotina:
         st.info("Nenhum dia de treino cadastrado ainda. Crie o primeiro acima.")
     else:
-        for chave_dia, exercicios in rotina.items():
-            with st.expander(f"🗂️ Treino {chave_dia}  ({len(exercicios)} exercícios)", expanded=False):
-                # Formulário pra adicionar exercício nesse dia
-                with st.form(f"form_add_exercicio_{chave_dia}", clear_on_submit=True):
-                    novo_exercicio = st.text_input("Novo exercício", key=f"input_{chave_dia}")
-                    adicionar = st.form_submit_button("Adicionar exercício")
-                    if adicionar and novo_exercicio:
-                        rotina[chave_dia].append(novo_exercicio)
+        atividades_cardio_comuns = ["Corrida", "Bike", "Elíptico", "Natação", "Outro"]
+
+        for chave_dia, itens in rotina.items():
+            with st.expander(f"🗂️ Treino {chave_dia}  ({len(itens)} itens)", expanded=False):
+                # Formulário pra adicionar um item (musculação ou cardio) nesse dia
+                with st.form(f"form_add_item_{chave_dia}", clear_on_submit=True):
+                    tipo_item = st.radio(
+                        "Tipo", ["Musculação", "Cardio"], horizontal=True, key=f"tipo_{chave_dia}",
+                    )
+
+                    if tipo_item == "Musculação":
+                        nome_item = st.text_input("Nome do exercício", key=f"input_musc_{chave_dia}")
+                    else:
+                        atividade_escolhida = st.selectbox(
+                            "Atividade", atividades_cardio_comuns, key=f"select_cardio_{chave_dia}",
+                        )
+                        nome_outro = ""
+                        if atividade_escolhida == "Outro":
+                            nome_outro = st.text_input("Qual atividade?", key=f"input_cardio_{chave_dia}")
+                        nome_item = nome_outro if atividade_escolhida == "Outro" else atividade_escolhida
+
+                    adicionar = st.form_submit_button("Adicionar")
+                    if adicionar and nome_item:
+                        tipo_salvo = "musculacao" if tipo_item == "Musculação" else "cardio"
+                        rotina[chave_dia].append({"nome": nome_item, "tipo": tipo_salvo})
                         salvar_rotina(rotina)
                         st.rerun()
 
-                # Lista de exercícios já cadastrados, cada um com botão de remover
-                if exercicios:
-                    for exercicio in exercicios:
+                # Lista de itens já cadastrados, cada um com botão de remover
+                if itens:
+                    for item in itens:
+                        icone = "🏋️" if item["tipo"] == "musculacao" else "🏃"
                         col_nome, col_remover = st.columns([4, 1])
-                        col_nome.write(f"• {exercicio}")
-                        if col_remover.button("🗑️", key=f"del_{chave_dia}_{exercicio}"):
-                            rotina[chave_dia].remove(exercicio)
+                        col_nome.write(f"{icone} {item['nome']}")
+                        if col_remover.button("🗑️", key=f"del_{chave_dia}_{item['nome']}_{item['tipo']}"):
+                            rotina[chave_dia].remove(item)
                             salvar_rotina(rotina)
                             st.rerun()
                 else:
-                    st.caption("Nenhum exercício ainda.")
+                    st.caption("Nenhum item ainda.")
 
                 if st.button(f"Excluir treino {chave_dia}", key=f"del_dia_{chave_dia}"):
                     del rotina[chave_dia]
@@ -473,14 +600,14 @@ with aba_registrar:
             nome = st.text_input("Ou digite o exercício manualmente")
         else:
             dia_escolhido = st.selectbox("Qual treino você fez hoje?", list(rotina.keys()))
-            exercicios_do_dia = rotina[dia_escolhido]
+            nomes_musculacao_do_dia = [item["nome"] for item in rotina[dia_escolhido] if item["tipo"] == "musculacao"]
 
-            if not exercicios_do_dia:
-                st.warning(f"O treino {dia_escolhido} ainda não tem exercícios cadastrados.")
+            if not nomes_musculacao_do_dia:
+                st.warning(f"O treino {dia_escolhido} ainda não tem exercícios de musculação cadastrados.")
                 nome = st.text_input("Ou digite o exercício manualmente")
             else:
                 # st.radio com os exercícios do dia = "clicar em qual fez"
-                nome = st.radio("Qual exercício você fez?", exercicios_do_dia)
+                nome = st.radio("Qual exercício você fez?", nomes_musculacao_do_dia)
 
         with st.form("form_registro_musculacao", clear_on_submit=True):
             data_treino = st.date_input("Data", value=date.today())
