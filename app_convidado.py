@@ -174,6 +174,16 @@ def dia_foi_cumprido(data_do_dia, treinos_planejados, rotina, df_treinos):
     return all((item["tipo"], item["nome"]) in concluidos for item in itens_planejados)
 
 
+def ultimo_registro(df_treinos, tipo, nome):
+    """Busca o registro mais recente de um exercício/atividade específica,
+    pra sugerir a carga (ou duração/distância) da última vez. Devolve None
+    se nunca foi registrado antes."""
+    registros = df_treinos[(df_treinos["tipo"] == tipo) & (df_treinos["nome"] == nome)]
+    if registros.empty:
+        return None
+    return registros.sort_values("data").iloc[-1]
+
+
 # ---------- Configuração da página ----------
 st.set_page_config(page_title="Treino App", page_icon="💪", layout="centered")
 
@@ -515,11 +525,20 @@ with aba_sessao:
                             st.rerun()
 
                         if st.session_state.exercicio_ativo == chave_item:
+                            ultimo = ultimo_registro(df_treinos, tipo_item, nome_item)
+
                             with st.form(f"form_sessao_{chave_item}"):
                                 if tipo_item == "musculacao":
-                                    peso = st.number_input("Peso (kg)", min_value=0.0, step=2.5, key=f"peso_{chave_item}")
-                                    reps = st.number_input("Repetições por série", min_value=0, step=1, key=f"reps_{chave_item}")
-                                    series = st.number_input("Número de séries", min_value=0, step=1, key=f"series_{chave_item}")
+                                    peso_sugerido = float(ultimo["peso_kg"]) if ultimo is not None else 0.0
+                                    reps_sugerido = int(ultimo["reps"]) if ultimo is not None else 0
+                                    series_sugerido = int(ultimo["series"]) if ultimo is not None else 0
+
+                                    if ultimo is not None:
+                                        st.caption(f"Última vez ({ultimo['data']}): {peso_sugerido}kg × {reps_sugerido} × {series_sugerido}")
+
+                                    peso = st.number_input("Peso (kg)", min_value=0.0, step=2.5, value=peso_sugerido, key=f"peso_{chave_item}")
+                                    reps = st.number_input("Repetições por série", min_value=0, step=1, value=reps_sugerido, key=f"reps_{chave_item}")
+                                    series = st.number_input("Número de séries", min_value=0, step=1, value=series_sugerido, key=f"series_{chave_item}")
                                     confirmar = st.form_submit_button("✅ Salvar")
                                     if confirmar:
                                         linha = {
@@ -531,8 +550,15 @@ with aba_sessao:
                                         st.session_state.exercicio_ativo = None
                                         st.rerun()
                                 else:
-                                    duracao = st.number_input("Duração (min)", min_value=0.0, step=5.0, key=f"dur_{chave_item}")
-                                    distancia = st.number_input("Distância (km, opcional)", min_value=0.0, step=0.5, key=f"dist_{chave_item}")
+                                    duracao_sugerida = float(ultimo["duracao_min"]) if ultimo is not None and str(ultimo["duracao_min"]).strip() not in ("", "nan") else 0.0
+                                    distancia_sugerida_txt = str(ultimo["distancia_km"]) if ultimo is not None else ""
+                                    distancia_sugerida = float(ultimo["distancia_km"]) if ultimo is not None and distancia_sugerida_txt.strip() not in ("", "nan") else 0.0
+
+                                    if ultimo is not None:
+                                        st.caption(f"Última vez ({ultimo['data']}): {duracao_sugerida:.0f} min" + (f" · {distancia_sugerida}km" if distancia_sugerida else ""))
+
+                                    duracao = st.number_input("Duração (min)", min_value=0.0, step=5.0, value=duracao_sugerida, key=f"dur_{chave_item}")
+                                    distancia = st.number_input("Distância (km, opcional)", min_value=0.0, step=0.5, value=distancia_sugerida, key=f"dist_{chave_item}")
                                     confirmar = st.form_submit_button("✅ Salvar")
                                     if confirmar:
                                         linha = {
